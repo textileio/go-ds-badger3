@@ -14,6 +14,7 @@ import (
 	dsq "github.com/ipfs/go-datastore/query"
 	logger "github.com/ipfs/go-log/v2"
 	goprocess "github.com/jbenet/goprocess"
+	dsextensions "github.com/textileio/go-datastore-extensions"
 	"go.uber.org/zap"
 )
 
@@ -112,6 +113,8 @@ var _ ds.TxnDatastore = (*Datastore)(nil)
 var _ ds.TTLDatastore = (*Datastore)(nil)
 var _ ds.GCDatastore = (*Datastore)(nil)
 var _ ds.Batching = (*Datastore)(nil)
+var _ dsextensions.DatastoreExtensions = (*Datastore)(nil)
+var _ dsextensions.TxnExt = (*txn)(nil)
 
 // NewDatastore creates a new badger datastore.
 //
@@ -205,6 +208,17 @@ func (d *Datastore) periodicGC() {
 // can be mutated without incurring changes to the underlying Datastore until
 // the transaction is Committed.
 func (d *Datastore) NewTransaction(readOnly bool) (ds.Txn, error) {
+	return d.newTransaction(readOnly)
+}
+
+// NewTransactionExtended starts a new transaction with dsextensions capabilities. The resulting transaction object
+// can be mutated without incurring changes to the underlying Datastore until
+// the transaction is Committed.
+func (d *Datastore) NewTransactionExtended(readOnly bool) (dsextensions.TxnExt, error) {
+	return d.newTransaction(readOnly)
+}
+
+func (d *Datastore) newTransaction(readOnly bool) (dsextensions.TxnExt, error) {
 	d.closeLk.RLock()
 	defer d.closeLk.RUnlock()
 	if d.closed {
@@ -363,6 +377,23 @@ func (d *Datastore) Query(q dsq.Query) (dsq.Results, error) {
 	// We cannot defer txn.Discard() here, as the txn must remain active while the iterator is open.
 	// https://github.com/dgraph-io/badger/commit/b1ad1e93e483bbfef123793ceedc9a7e34b09f79
 	// The closing logic in the query goprocess takes care of discarding the implicit transaction.
+
+	qe := dsextensions.QueryExt{Query: q}
+	return txn.query(qe)
+}
+
+func (d *Datastore) QueryExtended(q dsextensions.QueryExt) (dsq.Results, error) {
+	d.closeLk.RLock()
+	defer d.closeLk.RUnlock()
+	if d.closed {
+		return nil, ErrClosed
+	}
+
+	txn := d.newImplicitTransaction(true)
+	// We cannot defer txn.Discard() here, as the txn must remain active while the iterator is open.
+	// https://github.com/dgraph-io/badger/commit/b1ad1e93e483bbfef123793ceedc9a7e34b09f79
+	// The closing logic in the query goprocess takes care of discarding the implicit transaction.
+
 	return txn.query(q)
 }
 
@@ -667,10 +698,21 @@ func (t *txn) Query(q dsq.Query) (dsq.Results, error) {
 		return nil, ErrClosed
 	}
 
+	qe := dsextensions.QueryExt{Query: q}
+	return t.query(qe)
+}
+
+func (t *txn) QueryExtended(q dsextensions.QueryExt) (dsq.Results, error) {
+	t.ds.closeLk.RLock()
+	defer t.ds.closeLk.RUnlock()
+	if t.ds.closed {
+		return nil, ErrClosed
+	}
+
 	return t.query(q)
 }
 
-func (t *txn) query(q dsq.Query) (dsq.Results, error) {
+func (t *txn) query(q dsextensions.QueryExt) (dsq.Results, error) {
 	opt := badger.DefaultIteratorOptions
 	opt.PrefetchValues = !q.KeysOnly
 
@@ -705,10 +747,10 @@ func (t *txn) query(q dsq.Query) (dsq.Results, error) {
 			}
 
 			// fix the query
-			res = dsq.ResultsReplaceQuery(res, q)
+			res = dsq.ResultsReplaceQuery(res, q.Query)
 
 			// Remove the parts we've already applied.
-			naiveQuery := q
+			naiveQuery := q.Query
 			naiveQuery.Prefix = ""
 			naiveQuery.Filters = nil
 
@@ -718,7 +760,7 @@ func (t *txn) query(q dsq.Query) (dsq.Results, error) {
 	}
 
 	it := t.txn.NewIterator(opt)
-	qrb := dsq.NewResultBuilder(q)
+	qrb := dsq.NewResultBuilder(q.Query)
 	qrb.Process.Go(func(worker goprocess.Process) {
 		t.ds.closeLk.RLock()
 		closedEarly := false
@@ -750,6 +792,11 @@ func (t *txn) query(q dsq.Query) (dsq.Results, error) {
 
 		// All iterators must be started by rewinding.
 		it.Rewind()
+
+		// Seek to seek prefix if needed.
+		if q.SeekPrefix != "" {
+			it.Seek([]byte(q.SeekPrefix))
+		}
 
 		// skip to the offset
 		for skipped := 0; skipped < q.Offset && it.Valid(); it.Next() {
